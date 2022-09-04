@@ -107,7 +107,7 @@ export function TradeDashboard() {
     } | ZigZag Exchange`;
   }, [currentPairLastPrice]);
 
-  useEffect(() => {
+  useEffect(async () => {
     const urlParams = new URLSearchParams(search);
     const marketFromURL = urlParams.get(marketQueryParam);
     const networkFromURL = urlParams.get(networkQueryParam);
@@ -116,8 +116,7 @@ export function TradeDashboard() {
       updateMarketChain(marketFromURL);
     }
     if (chainid && network !== chainid) {
-      api.setAPIProvider(chainid);
-      api.signOut();
+      await api.setAPIProvider(chainid);
     }
     api.getWalletBalances();
   }, []);

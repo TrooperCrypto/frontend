@@ -19,6 +19,7 @@ import apiReducer, {
   setConnecting,
   setBridgeConnecting,
   setUISettings,
+  setWrongNetwork,
 } from "lib/store/features/api/apiSlice";
 import autoMergeLevel2 from "redux-persist/lib/stateReconciler/autoMergeLevel2";
 import api from "lib/api";
@@ -94,13 +95,13 @@ api.on("signIn", (accountState) => {
   store.dispatch(signIn(accountState));
 });
 
-api.on("signOut", (accountState) => {
+api.on("signOut", () => {
   store.dispatch(clearUserOrders());
   store.dispatch(signOut());
 });
 
-api.on("providerChange", (network) => {
-  console.log(`Index set pair to default: ${api.apiProvider.defaultMarket}`);
+api.on("providerChange", (network, defaultPair) => {
+  console.log(`Index set pair to default: ${api.apiProvider.defaultMarket[network]}`);
   store.dispatch(setNetwork(network));
   store.dispatch(setCurrentMarket(api.apiProvider.defaultMarket[network]));
 });
@@ -121,4 +122,11 @@ api.on("settings", (payload) => {
   store.dispatch(setUISettings(payload));
 });
 
+api.on("resetUserOrders", () => {  
+  store.dispatch(clearUserOrders());
+})
+
+api.on("wrongNetwork", (flag) => {
+  store.dispatch(setWrongNetwork(flag));
+})
 export default store;

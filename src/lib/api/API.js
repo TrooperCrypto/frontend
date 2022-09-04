@@ -1,4 +1,3 @@
-import Web3 from "web3";
 import { createIcon } from "@download/blockies";
 import Web3Modal from "web3modal";
 import Emitter from "tiny-emitter";
@@ -7,15 +6,16 @@ import WalletConnectProvider from "@walletconnect/web3-provider";
 import { getENSName } from "lib/ens";
 import { formatAmount } from "lib/utils";
 import erc20ContractABI from "lib/contracts/ERC20.json";
-import wethContractABI from "lib/contracts/WETH.json";
 import { MAX_ALLOWANCE } from "./constants";
 import { toast } from "react-toastify";
+/*
 import {
   ZKSYNC_POLYGON_BRIDGE,
   POLYGON_MUMBAI_WETH_ADDRESS,
   POLYGON_MAINNET_WETH_ADDRESS,
 } from "components/pages/BridgePage/constants";
-
+import wethContractABI from "lib/contracts/WETH.json";
+*/
 import axios from "axios";
 import { isMobile } from "react-device-detect";
 import get from "lodash/get";
@@ -32,7 +32,7 @@ export default class API extends Emitter {
   apiProvider = null;
   mainnetProvider = null;
   rollupProvider = null;
-  currencies = null;
+  provider = null;
   isArgent = false;
   marketInfo = {};
   lastPrices = {};
@@ -42,8 +42,10 @@ export default class API extends Emitter {
   _pendingOrders = [];
   _pendingFills = [];
   serverDelta = 0;
+  walletNetwork = null;
+  wrongNetwork = null;
 
-  constructor({ infuraId, networks, currencies, validMarkets }) {
+  constructor({ infuraId, networks }) {
     super();
 
     if (networks) {
@@ -57,17 +59,34 @@ export default class API extends Emitter {
     }
 
     this.infuraId = infuraId;
-    this.currencies = currencies;
-    this.validMarkets = validMarkets;
 
     if (window.ethereum) {
-      window.ethereum.on("accountsChanged", this.signOut);
-      window.ethereum.on("chainChanged", (chainId) => {
-        this.signOut().then(() => {
-          this.setAPIProvider(chainMap[chainId]);
-        });
+      window.ethereum.on("accountsChanged", async () => {
+        this.emit("connecting", true);
+        try {
+          this.resetL2Data();
+          await this.updateUserData();
+        } catch (e) {
+          console.warn(`Failed to switchAPIProvider: ${e.message}`)
+        }
+        this.emit("connecting", false);
+      });
+      window.ethereum.on("chainChanged", async (chainId) => {
+        this.emit("connecting", true);
+          try {
+          this.walletNetwork = chainMap[chainId] || 0;
+          this.emit("wrongNetwork", this.wrongNetwork());
+          await this.setAPIProvider(chainMap[chainId]);
+        } catch (e) {
+          console.warn(`Failed to switchAPIProvider: ${e.message}`)
+        }
+        this.emit("connecting", false);
+      });
+      window.ethereum.on("disconnect", () => {
+        this.signOut();
       });
 
+      this.walletNetwork = chainMap[window.ethereum.chainId];
       this.setAPIProvider(chainMap[window.ethereum.chainId] || 1);
     } else {
       console.log(this.networks);
@@ -79,24 +98,48 @@ export default class API extends Emitter {
     return this.networks[this.getNetworkName(network)][1];
   };
 
-  setAPIProvider = (network, networkChanged = true) => {
+  switchAPIProvider = async (network) => {
+    this.emit("connecting", true);
+    try {
+      await this.refreshNetwork(network);
+      await this.setAPIProvider(network);
+    } catch (e) {
+      console.warn(`Failed to switchAPIProvider: ${e.message}`)
+    }
+    this.emit("connecting", false);
+  }
+
+  setAPIProvider = async (network) => {
     const chainName = this.getChainName(network);
 
     if (!chainName) {
       console.error(`Can't get chainName for ${network}`);
-      this.signOut();
       return;
     }
+
+    this.resetL2Data();
     const oldNetwork = this.apiProvider?.network;
-    const apiProvider = this.getAPIProvider(network);
+    const apiProvider = this.getAPIProvider(network); 
     this.apiProvider = apiProvider;
+
+    // reset mainnetProvider if L1 chain changed
+    if (this.getChainNameL1(oldNetwork) !== this.getChainNameL1(network)) {
+      this.resetL1Data();    
+      this.mainnetProvider = new ethers.providers.InfuraProvider(
+        this.getChainNameL1(network),
+        this.infuraId
+      );
+    }
+    
+    console.log(`this.apiProvider.defaultMarket ==> ${this.apiProvider.defaultMarket}`)
+    this.emit("providerChange", network, this.apiProvider.defaultMarket);
 
     // Change WebSocket if necessary
     if (this.ws) {
       const oldUrl = new URL(this.ws.url);
       const newUrl = new URL(this.apiProvider.websocketUrl);
-      if (oldUrl.host !== newUrl.host) {
-        // Stopping the WebSocket will trigger an auto-restart in 3 seconds
+      if (oldUrl.host !== newUrl.host) { 
+        // Starting the WebSocket will close the old and start a new connection
         this.start();
       }
       if (oldNetwork !== this.apiProvider.network) {
@@ -104,13 +147,6 @@ export default class API extends Emitter {
         this.send("marketsreq", [this.apiProvider.network, true]);
       }
     }
-
-    this.web3 = new Web3(
-      window.ethereum ||
-        new Web3.providers.HttpProvider(
-          `https://${chainName}.infura.io/v3/${this.infuraId}`
-        )
-    );
 
     if (chainName === "arbitrum") {
       this.web3Modal = new Web3Modal({
@@ -162,11 +198,8 @@ export default class API extends Emitter {
       });
     }
 
-    this.getAccountState().catch((err) => {
-      console.log("Failed to switch providers", err);
-    });
-
-    if (networkChanged) this.emit("providerChange", network);
+    this.emit("wrongNetwork", this.wrongNetwork());
+    await this.updateUserData();
   };
 
   getProfile = async (address) => {
@@ -208,29 +241,28 @@ export default class API extends Emitter {
     };
 
     if (!this._profiles[address]) {
-      const profile = (this._profiles[address] = {
+      const profile = {
         description: null,
         website: null,
         image: null,
         address,
-      });
+      };
 
-      if (!address) {
-        return profile;
+      if (address) {
+        profile.name = `${address.substr(0, 6)}…${address.substr(-6)}`;
+        Object.assign(
+          profile,
+          ...(await Promise.all([
+            fetchENSName(address),
+            getProfileFromIPFS(address),
+          ]))
+        );
+
+        if (!profile.image) {
+          profile.image = createIcon({ seed: address }).toDataURL();
+        }
       }
-
-      profile.name = `${address.substr(0, 6)}…${address.substr(-6)}`;
-      Object.assign(
-        profile,
-        ...(await Promise.all([
-          fetchENSName(address),
-          getProfileFromIPFS(address),
-        ]))
-      );
-
-      if (!profile.image) {
-        profile.image = createIcon({ seed: address }).toDataURL();
-      }
+      this._profiles[address] = profile;
     }
 
     return this._profiles[address];
@@ -282,13 +314,11 @@ export default class API extends Emitter {
     }
   };
 
-  refreshNetwork = async () => {
+  refreshNetwork = async (network) => {
     if (!window.ethereum) return;
     let ethereumChainId, ethereumChainInfo;
 
-    // await this.signOut();
-
-    switch (this.apiProvider.network) {
+    switch (network) {
       case 1:
         ethereumChainId = "0x1";
         ethereumChainInfo = {
@@ -330,16 +360,18 @@ export default class API extends Emitter {
         params: [{ chainId: ethereumChainId }],
       });
     } catch (switchError) {
-      try {
-        if (switchError.code === 4902) {
-          await window.ethereum.request({
-            method: "wallet_addEthereumChain",
-            params: [ethereumChainInfo],
-          });
+      if (switchError.code === 4902) {
+        try {
+            await window.ethereum.request({
+              method: "wallet_addEthereumChain",
+              params: [ethereumChainInfo],
+            });
+        } catch (addError) {
+          console.error(addError);
+          throw addError;
         }
-      } catch (addError) {
-        console.error(addError);
-        throw addError;
+      } else {
+        throw switchError;
       }
     }
   };
@@ -426,56 +458,22 @@ export default class API extends Emitter {
             this.apiProvider = this.getAPIProvider(network);
           }
 
-          await this.refreshNetwork();
-          await this.sleep(1000);
-          const web3Provider = await this.web3Modal.connect();
-          this.web3.setProvider(web3Provider);
-          this.rollupProvider = new ethers.providers.Web3Provider(web3Provider);
-
+          this.web3Provider = await this.web3Modal.connect();
+          this.rollupProvider = new ethers.providers.Web3Provider(this.web3Provider, "any");
           this.mainnetProvider = new ethers.providers.InfuraProvider(
             this.getChainNameL1(network),
             this.infuraId
           );
+          await this.refreshNetwork(network);
 
+          /*
           // set up polygon providers. mumbai for testnet. polygon for mainnet
           this.polygonProvider = new ethers.providers.JsonRpcProvider(
             this.getPolygonUrl(network)
           );
+          */
 
-          let accountState;
-          try {
-            accountState = await this.apiProvider.signIn(...args);
-          } catch (err) {
-            await this.signOut();
-            throw err;
-          }
-
-          if (accountState.err === 4001) {
-            await this.signOut();
-            return;
-          }
-
-          try {
-            accountState.profile = await this.getProfile(accountState.address);
-          } catch (e) {
-            accountState.profile = {};
-          }
-
-          this.emit("signIn", accountState);
-
-          if (accountState && accountState.id) {
-            this.send("login", [
-              network,
-              accountState.id && accountState.id.toString(),
-            ]);
-          }
-
-          // fetch blances
-          await this.getBalances();
-          await this.getWalletBalances();
-          await this.getPolygonWethBalance();
-
-          return accountState;
+          await this.updateUserData().catch(e => console.warn(e));
         })
         .finally(() => {
           this._signInProgress = null;
@@ -495,24 +493,70 @@ export default class API extends Emitter {
     if (isMobile) window.localStorage.clear();
     else window.localStorage.removeItem("walletconnect");
 
+    this.web3Provider = null;
+    this.resetL1Data();
+    this.resetL2Data();
+    this.emit("signOut");
+  };
+
+  resetL2Data = () => {
     this.balances = {};
     this._profiles = {};
     this._pendingOrders = [];
     this._pendingFills = [];
-
-    this.web3 = null;
-    this.web3Modal = null;
-    this.rollupProvider = null;
-    this.mainnetProvider = null;
     this.isArgent = false;
-    this.setAPIProvider(this.apiProvider.network, false);
-    this.emit("balanceUpdate", "wallet", {});
-    this.emit("balanceUpdate", this.apiProvider.network, {});
-    this.emit("balanceUpdate", "polygon", {});
-    this.emit("accountState", {});
-    this.emit("signOut");
-  };
 
+    this.emit("accountState", {});
+    this.emit("resetUserOrders")
+  }
+
+  resetL1Data = () => {
+    this.mainnetProvider = null;
+  }
+
+  updateUserData = async () => {
+    if (!this.rollupProvider || this.wrongNetwork()) return;
+
+    let accountState;
+    try {
+      accountState = {...await this.apiProvider.signIn()};
+    } catch (err) {
+      await this.signOut();
+      throw err;
+    }
+
+    try {
+      accountState.profile = await this.getProfile(accountState.address);
+    } catch (e) {
+      accountState.profile = {};
+    }
+
+    this.emit("signIn", accountState);
+
+    if (accountState && accountState.id) {
+      this.send("login", [
+        this.apiProvider.network,
+        accountState.id && accountState.id.toString(),
+      ]);
+    }
+
+    const { balances } = accountState?.committed;
+    if (balances && Object.keys(balances).length) {
+      this.balances[this.apiProvider.network] = balances;
+      this.emit("balanceUpdate", this.apiProvider.network, balances);
+    }
+
+    await this.getWalletBalances();
+  }
+
+  getAddress = async () => {
+    if (!this.rollupProvider) return;
+
+    const signer = this.rollupProvider.getSigner();
+    return await signer.getAddress();
+  }
+
+  /*
   getPolygonUrl(network) {
     switch (network) {
       case 1:
@@ -554,8 +598,7 @@ export default class API extends Emitter {
   }
 
   getPolygonWethBalance = async () => {
-    const [account] = await this.web3.eth.getAccounts();
-    if (!account) return;
+    if (!await this.getAddress()) return;
     const polygonEthAddress = this.getPolygonWethContract(
       this.apiProvider.network
     );
@@ -567,7 +610,7 @@ export default class API extends Emitter {
       erc20ContractABI,
       this.polygonProvider
     );
-    const wethBalance = await ethContract.balanceOf(account);
+    const wethBalance = await ethContract.balanceOf(await this.getAddress());
     let p = formatAmount(wethBalance, { decimals: 18 });
 
     this.emit("balanceUpdate", "polygon", {
@@ -642,6 +685,7 @@ export default class API extends Emitter {
       throw e;
     }
   };
+  */
 
   getNetworkName = (network) => {
     const keys = Object.keys(this.networks);
@@ -710,6 +754,8 @@ export default class API extends Emitter {
   };
 
   cancelOrder = async (orderId) => {
+    if (this.wrongNetwork()) return;
+
     const token = localStorage.getItem(orderId);
     // token is used to cancel the order - otherwiese the user is asked to sign a msg
     if (token) {
@@ -740,6 +786,8 @@ export default class API extends Emitter {
   };
 
   depositL2 = async (amount, token, address) => {
+    if (this.wrongNetwork()) return;
+    
     return await this.apiProvider.depositL2(amount, token, address);
   };
 
@@ -756,10 +804,14 @@ export default class API extends Emitter {
   };
 
   withdrawL2 = async (amount, token) => {
+    if (this.wrongNetwork()) return;
+
     return await this.apiProvider.withdrawL2(amount, token);
   };
 
   transferToBridge = (amount, token, address, userAddress) => {
+    if (this.wrongNetwork()) return;
+
     return this.apiProvider.transferToBridge(
       amount,
       token,
@@ -800,6 +852,8 @@ export default class API extends Emitter {
   };
 
   cancelAllOrders = async (orderIds) => {
+    if (this.wrongNetwork()) return;
+
     const { id: userId } = await this.getAccountState();
     const tokenArray = [];
     orderIds.forEach((id) => {
@@ -835,7 +889,9 @@ export default class API extends Emitter {
   };
 
   cancelAllOrdersAllChains = async () => {
-    const toastMsg = toast.info("Sign the message to cancel your order...", {
+    if (this.wrongNetwork()) return;
+
+    const toastMsg = toast.info('Sign the message to cancel your order...', {
       toastId: "Sign the message to cancel your order...'",
     });
 
@@ -861,16 +917,15 @@ export default class API extends Emitter {
 
   approveSpendOfCurrency = async (currency) => {
     const netContract = this.getNetworkContract();
-    if (netContract) {
-      const [account] = await this.web3.eth.getAccounts();
+    if (ethers.utils.isAddress(netContract)) {
       const currencyInfo = this.getCurrencyInfo(currency);
-      const contract = new this.web3.eth.Contract(
+      const contract = new this.mainnetProvider.eth.Contract(
         erc20ContractABI,
         currencyInfo.address
       );
       await contract.methods
         .approve(netContract, MAX_ALLOWANCE)
-        .send({ from: account });
+        .send({ from: await this.getAddress() });
 
       // update allowances after successfull approve
       this.getWalletBalances();
@@ -882,38 +937,40 @@ export default class API extends Emitter {
     let result = { balance: 0, allowance: ethersConstants.Zero };
     if (!this.mainnetProvider) return result;
 
+    let address;
     try {
-      const netContract = this.getNetworkContract();
-      const [account] = await this.web3.eth.getAccounts();
-      if (!account || account === "0x") return result;
+      address = await this.getAddress()
+      if (!ethers.utils.isAddress(address)) return result;
 
       if (currency === "ETH") {
-        result.balance = await this.mainnetProvider.getBalance(account);
+        result.balance = await this.mainnetProvider.getBalance(address);
         result.allowance = ethersConstants.MaxUint256;
         return result;
       }
 
-      if (!currencyInfo || !currencyInfo.address) return result;
+      if (!ethers.utils.isAddress(currencyInfo?.address)) return result;
 
       const contract = new ethers.Contract(
         currencyInfo.address,
         erc20ContractABI,
         this.mainnetProvider
       );
-      result.balance = await contract.balanceOf(account);
-      if (netContract) {
+      result.balance = await contract.balanceOf(address);
+      const netContract = this.getNetworkContract();
+      if (ethers.utils.isAddress(netContract)) {
         result.allowance = ethers.BigNumber.from(
-          await contract.allowance(account, netContract)
+          await contract.allowance(address, netContract)
         );
       }
       return result;
     } catch (e) {
-      console.log(e);
+      console.warn(e.message);
       return result;
     }
   };
 
   getWalletBalances = async () => {
+    if (!this.mainnetProvider) return;
     const balances = {};
 
     const getBalance = async (ticker) => {
@@ -931,8 +988,6 @@ export default class API extends Emitter {
           decimals: 18,
         });
       }
-
-      this.emit("balanceUpdate", "wallet", { ...balances });
     };
 
     const tickers = this.getCurrencies();
@@ -943,10 +998,13 @@ export default class API extends Emitter {
 
     await Promise.all(tickers.map((ticker) => getBalance(ticker)));
 
+    this.emit("balanceUpdate", "wallet", { ...balances });
     return balances;
   };
 
   getBalances = async () => {
+    if (this.wrongNetwork() || !this.rollupProvider) return;
+
     const balances = await this.apiProvider.getBalances();
     this.balances[this.apiProvider.network] = balances;
     this.emit("balanceUpdate", this.apiProvider.network, balances);
@@ -986,6 +1044,8 @@ export default class API extends Emitter {
   };
 
   submitOrder = async (market, side, baseAmount, quoteAmount, orderType) => {
+    if (this.wrongNetwork()) return;
+
     if (!quoteAmount || !baseAmount) {
       throw new Error("Set base or quote amount");
     }
@@ -1051,6 +1111,8 @@ export default class API extends Emitter {
   };
 
   warpETH = async (amount) => {
+    if (this.wrongNetwork()) return;
+
     if (!amount) throw new Error("No amount set");
     let amountBN = ethers.utils.parseEther(amount.toFixed(18));
 
@@ -1058,6 +1120,8 @@ export default class API extends Emitter {
   };
 
   unWarpETH = async (amount) => {
+    if (this.wrongNetwork()) return;
+
     if (!amount) throw new Error("No amount set");
     let amountBN = ethers.utils.parseEther(amount.toFixed(18));
 
@@ -1268,5 +1332,9 @@ export default class API extends Emitter {
           throw Error("Chain ID not understood");
       }
     }
+  };
+
+  wrongNetwork = () => {
+    return this.walletNetwork !== this.apiProvider.network;
   };
 }

@@ -254,9 +254,9 @@ export const Header = (props) => {
   // state to open or close the sidebar in mobile
   const [show, setShow] = useState(false);
   const connecting = useSelector(isConnectingSelector);
-  // const [connecting, setConnecting] = useState(false);
   const user = useSelector(userSelector);
   const network = useSelector(networkSelector);
+
   const hasBridge = api.isImplemented("depositL2");
   const isEVM = api.isEVMChain();
   const history = useHistory();
@@ -267,6 +267,7 @@ export const Header = (props) => {
   const [networkItems, setNetWorkItems] = useState(networkLists);
   const { isDark, toggleTheme } = useTheme();
   const location = useLocation();
+
   useEffect(() => {
     const netName = networkLists.filter((item, i) => {
       return item.value === network;
@@ -287,7 +288,6 @@ export const Header = (props) => {
 
   useEffect(() => {
     api.emit("connecting", props.isLoading);
-    // setConnecting(props.isLoading)
   }, [props.isLoading]);
 
   useEffect(() => {
@@ -325,11 +325,10 @@ export const Header = (props) => {
   };
 
   const changeNetwork = async (text, value) => {
-    setNetworkName(text);
-
-    api.setAPIProvider(value);
+    if (value === api.apiProvider.network) return;
+    
     try {
-      await api.refreshNetwork();
+      await api.switchAPIProvider(value, true);
     } catch (err) {
       console.log(err);
     }
@@ -397,7 +396,7 @@ export const Header = (props) => {
             </Link>
           </LogoWrapper>
           <ButtonWrapper>
-            {user.address ? (
+            {user.address && !connecting ? (
               <>
                 <AccountDropdown networkName={networkName} />
               </>
@@ -489,7 +488,7 @@ export const Header = (props) => {
               <ToggleTheme isDark={isDark} toggleTheme={toggleTheme} />
             </LanguageWrapper>
             <VerticalDivider />
-
+            
             <Dropdown
               adClass="network-dropdown"
               width={190}
@@ -499,7 +498,7 @@ export const Header = (props) => {
               leftIcon={true}
             />
 
-            {user.address ? (
+            {user.address && !connecting ? (
               <AccountDropdown networkName={networkName} />
             ) : (
               <ConnectWalletButton />

@@ -21,63 +21,73 @@ export default class APIArbitrumProvider extends APIProvider {
   getBalances = async () => {
     const balances = {};
     if (!this.accountState?.address) return balances;
+    try {
+      // generate token list
+      const tokenInfoList = [];
+      const tokenList = [];
+      this.api.getCurrencies().forEach((token) => {
+        const tokenInfo = this.api.getCurrencyInfo(token);
+        if (!tokenInfo || !tokenInfo.address) return;
 
-    // generate token list
-    const tokenInfoList = [];
-    const tokenList = [];
-    this.api.getCurrencies().forEach((token) => {
-      const tokenInfo = this.api.getCurrencyInfo(token);
-      if (!tokenInfo || !tokenInfo.address) return;
+        tokenInfoList.push(tokenInfo);
+        tokenList.push(tokenInfo.address);
+      })
 
-      tokenInfoList.push(tokenInfo);
-      tokenList.push(tokenInfo.address);
-    });
+      // allways get ETH
+      tokenInfoList.push({ decimals: 18, symbol: 'ETH' });
+      tokenList.push(ethers.constants.AddressZero);
 
-    // allways get ETH
-    tokenInfoList.push({ decimals: 18, symbol: "ETH" });
-    tokenList.push(ethers.constants.AddressZero);
+      // get token balance
+      const erc20Contract = new ethers.Contract(
+        balanceBundlerAddress,
+        balanceBundleABI,
+        this.api.rollupProvider
+      );
+      const balanceList = await erc20Contract.balances(
+        [this.accountState.address],
+        tokenList
+      );
+      const exchangeAddress = this.getExchangeAddress();
 
-    // get token balance
-    const erc20Contract = new ethers.Contract(
-      balanceBundlerAddress,
-      balanceBundleABI,
-      this.api.rollupProvider
-    );
-    const balanceList = await erc20Contract.balances(
-      [this.accountState.address],
-      tokenList
-    );
-    const exchangeAddress = this.getExchangeAddress();
+      // generate object
+      for (let i = 0; i < tokenInfoList.length; i++) {
+        let balanceBN = balanceList[i];
+        const currencyInfo = tokenInfoList[i];
 
-    // generate object
-    for (let i = 0; i < tokenInfoList.length; i++) {
-      let balanceBN = balanceList[i];
-      const currencyInfo = tokenInfoList[i];
+        let allowanceBN = ethers.BigNumber.from(0);
+        if (currencyInfo.symbol === "ETH") {
+          allowanceBN = ethers.constants.MaxUint256;
+        } else if (
+          currencyInfo &&
+          exchangeAddress &&
+          balanceBN.gt(0)
+        ) {
+          allowanceBN = await this.getAllowance(currencyInfo.address, exchangeAddress); // TODO replace
+        }
+        const valueReadable =
+          balanceBN && currencyInfo
+            ? ethers.utils.formatUnits(
+              balanceBN,
+              currencyInfo.decimals
+            )
+            : 0;
+        const allowanceReadable =
+          allowanceBN && currencyInfo
+            ? ethers.utils.formatUnits(
+              allowanceBN,
+              currencyInfo.decimals
+            )
+            : 0;
 
-      let allowanceBN = ethers.BigNumber.from(0);
-      if (currencyInfo.symbol === "ETH") {
-        allowanceBN = ethers.constants.MaxUint256;
-      } else if (currencyInfo && exchangeAddress && balanceBN.gt(0)) {
-        allowanceBN = await this.getAllowance(
-          currencyInfo.address,
-          exchangeAddress
-        ); // TODO replace
+        balances[currencyInfo.symbol] = {
+          value: balanceBN,
+          valueReadable,
+          allowance: allowanceBN,
+          allowanceReadable,
+        };
       }
-      const valueReadable =
-        balanceBN && currencyInfo
-          ? ethers.utils.formatUnits(balanceBN, currencyInfo.decimals)
-          : 0;
-      const allowanceReadable =
-        allowanceBN && currencyInfo
-          ? ethers.utils.formatUnits(allowanceBN, currencyInfo.decimals)
-          : 0;
-
-      balances[currencyInfo.symbol] = {
-        value: balanceBN,
-        valueReadable,
-        allowance: allowanceBN,
-        allowanceReadable,
-      };
+    } catch (e) {
+      console.log(e.message)
     }
 
     return balances;
@@ -214,11 +224,11 @@ export default class APIArbitrumProvider extends APIProvider {
 
   signIn = async () => {
     console.log("signing in to arbitrum");
-    const [account] = await this.api.web3.eth.getAccounts();
+    const address = await this.api.getAddress();
     const balances = await this.getBalances();
     this.accountState = {
-      id: account,
-      address: account,
+      id: address,
+      address: address,
       committed: {
         balances,
       },
